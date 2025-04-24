@@ -67,11 +67,6 @@ class VQModel(nn.Module):
 
 
 class EncoderPatch(nn.Module):
-    """
-    Non-overlapping patch embedding with NavIT-style LayerNorm+Linear+LayerNorm:
-      - Input:  (B, 3, 256, 256)
-      - Output: (B, z_channels, 16, 16)
-    """
     def __init__(self, in_channels=3, z_channels=256, patch_size=32):
         super().__init__()
         self.patch_size = patch_size
