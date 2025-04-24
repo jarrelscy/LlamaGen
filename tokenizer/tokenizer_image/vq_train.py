@@ -18,6 +18,7 @@ import time
 import argparse
 from glob import glob
 from copy import deepcopy
+import wandb  # Import wandb at the top level
 
 import sys
 # Add the project root directory to the Python path
@@ -70,8 +71,13 @@ def main(args):
         cloud_checkpoint_dir = f"{cloud_results_dir}/{experiment_index:03d}-{model_string_name}/checkpoints"
         os.makedirs(cloud_checkpoint_dir, exist_ok=True)
         logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
-        import wandb
-        wandb.init(project="llamaggen_tokenizer", config=vars(args))
+        
+        # Initialize wandb only on rank 0
+        wandb.init(
+            project="llamagen_tokenizer",
+            name=f"{model_string_name}-{time_record}",
+            config=vars(args)
+        )
     
     else:
         logger = create_logger(None)
@@ -207,12 +213,9 @@ def main(args):
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 recons_imgs, codebook_loss = vq_model(imgs)
-                loss_dict = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1,
+                loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=vq_model.module.decoder.last_layer,
                                    logger=logger, log_every=args.log_every)
-                loss_gen = loss_dict["total_loss"]
-                perceptual_loss = loss_dict.get("perceptual_loss")
-                reconstruction_loss = loss_dict.get("reconstruction_loss")
             scaler.scale(loss_gen).backward()
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
@@ -234,12 +237,9 @@ def main(args):
             scaler_disc.step(optimizer_disc)
             scaler_disc.update()
             
+            # Log loss values:
             running_gen_loss += loss_gen.item()
             running_disc_loss += loss_disc.item()
-            if perceptual_loss is not None:
-                running_perceptual_loss += perceptual_loss.item()
-            if reconstruction_loss is not None:
-                running_reconstruction_loss += reconstruction_loss.item()
             
             log_steps += 1
             train_steps += 1
@@ -248,29 +248,33 @@ def main(args):
                 end_time = time.time()
                 steps_per_sec = log_steps / (end_time - start_time)
 
+                # Calculate average losses
                 avg_gen_loss = running_gen_loss / log_steps
                 avg_disc_loss = running_disc_loss / log_steps
-                avg_overall_loss = (running_gen_loss + running_disc_loss) / log_steps
-                avg_perc_loss = running_perceptual_loss / log_steps if log_steps > 0 else 0.0
-                avg_recon_loss = running_reconstruction_loss / log_steps if log_steps > 0 else 0.0
+                avg_overall_loss = avg_gen_loss + avg_disc_loss
 
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_overall_loss:.4f}, Gen Loss: {avg_gen_loss:.4f}, Disc Loss: {avg_disc_loss:.4f}, Perc Loss: {avg_perc_loss:.4f}, Recon Loss: {avg_recon_loss:.4f}, Steps/Sec: {steps_per_sec:.2f}")
+                # Log to console
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_overall_loss:.4f}, "
+                          f"Gen Loss: {avg_gen_loss:.4f}, Disc Loss: {avg_disc_loss:.4f}, "
+                          f"Steps/Sec: {steps_per_sec:.2f}")
 
+                # Log to wandb on rank 0
                 if rank == 0:
-                    import wandb
                     wandb.log({
                         "overall_loss": avg_overall_loss,
                         "gen_loss": avg_gen_loss,
                         "disc_loss": avg_disc_loss,
-                        "perceptual_loss": avg_perc_loss,
-                        "reconstruction_loss": avg_recon_loss,
-                        "steps_per_sec": steps_per_sec
+                        "steps_per_sec": steps_per_sec,
+                        "epoch": epoch,
+                        "vq_loss": codebook_loss[0].item(),
+                        "commit_loss": codebook_loss[1].item(),
+                        "entropy_loss": codebook_loss[2].item(),
+                        "codebook_usage": codebook_loss[3],
                     }, step=train_steps)
 
+                # Reset monitoring variables
                 running_gen_loss = 0.0
                 running_disc_loss = 0.0
-                running_perceptual_loss = 0.0
-                running_reconstruction_loss = 0.0
                 log_steps = 0
                 start_time = time.time()
 
