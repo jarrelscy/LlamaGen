@@ -18,6 +18,11 @@ import argparse
 from glob import glob
 from copy import deepcopy
 
+import sys
+# Add the project root directory to the Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, project_root)
+
 from utils.logger import create_logger
 from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
@@ -64,6 +69,8 @@ def main(args):
         cloud_checkpoint_dir = f"{cloud_results_dir}/{experiment_index:03d}-{model_string_name}/checkpoints"
         os.makedirs(cloud_checkpoint_dir, exist_ok=True)
         logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
+        import wandb
+        wandb.init(project="llamaggen_tokenizer", config=vars(args))
     
     else:
         logger = create_logger(None)
@@ -81,6 +88,7 @@ def main(args):
         commit_loss_beta=args.commit_loss_beta,
         entropy_loss_ratio=args.entropy_loss_ratio,
         dropout_p=args.dropout_p,
+        use_encoder_patch=args.use_encoder_patch
     )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
@@ -177,13 +185,20 @@ def main(args):
 
     # Variables for monitoring/logging purposes:
     log_steps = 0
-    running_loss = 0
+    running_gen_loss = 0.0
+    running_disc_loss = 0.0
+    running_perceptual_loss = 0.0
+    running_reconstruction_loss = 0.0
     start_time = time.time()
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+        running_gen_loss = 0.0
+        running_disc_loss = 0.0
+        running_perceptual_loss = 0.0
+        running_reconstruction_loss = 0.0
         for x, y in loader:
             imgs = x.to(device, non_blocking=True)
 
@@ -191,9 +206,12 @@ def main(args):
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 recons_imgs, codebook_loss = vq_model(imgs)
-                loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
-                                   last_layer=vq_model.module.decoder.last_layer, 
+                loss_dict = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1,
+                                   last_layer=vq_model.module.decoder.last_layer,
                                    logger=logger, log_every=args.log_every)
+                loss_gen = loss_dict["total_loss"]
+                perceptual_loss = loss_dict.get("perceptual_loss")
+                reconstruction_loss = loss_dict.get("reconstruction_loss")
             scaler.scale(loss_gen).backward()
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
@@ -215,23 +233,43 @@ def main(args):
             scaler_disc.step(optimizer_disc)
             scaler_disc.update()
             
-            # # Log loss values:
-            running_loss += loss_gen.item() + loss_disc.item()
+            running_gen_loss += loss_gen.item()
+            running_disc_loss += loss_disc.item()
+            if perceptual_loss is not None:
+                running_perceptual_loss += perceptual_loss.item()
+            if reconstruction_loss is not None:
+                running_reconstruction_loss += reconstruction_loss.item()
             
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
-                # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time.time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                # Reset monitoring variables:
-                running_loss = 0
+
+                avg_gen_loss = running_gen_loss / log_steps
+                avg_disc_loss = running_disc_loss / log_steps
+                avg_overall_loss = (running_gen_loss + running_disc_loss) / log_steps
+                avg_perc_loss = running_perceptual_loss / log_steps if log_steps > 0 else 0.0
+                avg_recon_loss = running_reconstruction_loss / log_steps if log_steps > 0 else 0.0
+
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_overall_loss:.4f}, Gen Loss: {avg_gen_loss:.4f}, Disc Loss: {avg_disc_loss:.4f}, Perc Loss: {avg_perc_loss:.4f}, Recon Loss: {avg_recon_loss:.4f}, Steps/Sec: {steps_per_sec:.2f}")
+
+                if rank == 0:
+                    import wandb
+                    wandb.log({
+                        "overall_loss": avg_overall_loss,
+                        "gen_loss": avg_gen_loss,
+                        "disc_loss": avg_disc_loss,
+                        "perceptual_loss": avg_perc_loss,
+                        "reconstruction_loss": avg_recon_loss,
+                        "steps_per_sec": steps_per_sec
+                    }, step=train_steps)
+
+                running_gen_loss = 0.0
+                running_disc_loss = 0.0
+                running_perceptual_loss = 0.0
+                running_reconstruction_loss = 0.0
                 log_steps = 0
                 start_time = time.time()
 
@@ -305,12 +343,13 @@ if __name__ == "__main__":
     parser.add_argument("--beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--beta2", type=float, default=0.95, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--global-batch-size", type=int, default=128)
+    parser.add_argument("--global-batch-size", type=int, default=64)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
+    parser.add_argument("--use-encoder-patch", action='store_true', default=False, help="Use encoder patch instead of regular encoder")
     args = parser.parse_args()
     main(args)

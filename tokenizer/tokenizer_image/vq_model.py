@@ -23,13 +23,19 @@ class ModelArgs:
     z_channels: int = 256
     dropout_p: float = 0.0
 
+    use_encoder_patch: bool = False
+
 
 
 class VQModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
-        self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
+        if not config.use_encoder_patch:
+            self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
+        else:
+            self.encoder = EncoderPatch(in_channels=3, z_channels=config.z_channels, patch_size=2 ** (len(config.encoder_ch_mult) - 1))
+
         self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
 
         self.quantize = VectorQuantizer(config.codebook_size, config.codebook_embed_dim, 
@@ -60,6 +66,46 @@ class VQModel(nn.Module):
         return dec, diff
 
 
+class EncoderPatch(nn.Module):
+    """
+    Non-overlapping patch embedding with NavIT-style LayerNorm+Linear+LayerNorm:
+      - Input:  (B, 3, 256, 256)
+      - Output: (B, z_channels, 16, 16)
+    """
+    def __init__(self, in_channels=3, z_channels=256, patch_size=32):
+        super().__init__()
+        self.patch_size = patch_size
+        self.z_channels = z_channels
+        # number of input features per patch
+        patch_dim = in_channels * patch_size * patch_size
+
+        self.to_patch_embedding = nn.Sequential(
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, z_channels * 4),
+            nn.GELU(),
+            nn.Linear(z_channels * 4, z_channels),
+            nn.GELU(),
+            nn.LayerNorm(z_channels),
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        p = self.patch_size
+        # unfold into non-overlapping patches
+        patches = x.unfold(2, p, p).unfold(3, p, p)    # (B, C, H/p, W/p, p, p)
+        patches = patches.contiguous().view(B, C, H//p, W//p, p, p)
+        # (B, H/p, W/p, C, p, p) → (B, N, patch_dim)
+        patches = patches.permute(0, 2, 3, 1, 4, 5)    # (B, H/p, W/p, C, p, p)
+        num_patches = (H//p)*(W//p)
+        patches = patches.reshape(B, num_patches, C * p * p)
+
+        # embed each patch
+        embeddings = self.to_patch_embedding(patches) # (B, N, z_channels)
+
+        # reshape back to spatial grid
+        h = int((num_patches)**0.5)
+        out = embeddings.permute(0, 2, 1).view(B, self.z_channels, h, h)
+        return out
 
 class Encoder(nn.Module):
     def __init__(self, in_channels=3, ch=128, ch_mult=(1,1,2,2,4), num_res_blocks=2, 
@@ -421,4 +467,8 @@ def VQ_8(**kwargs):
 def VQ_16(**kwargs):
     return VQModel(ModelArgs(encoder_ch_mult=[1, 1, 2, 2, 4], decoder_ch_mult=[1, 1, 2, 2, 4], **kwargs))
 
-VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8}
+def VQ_32(**kwargs):
+    return VQModel(ModelArgs(encoder_ch_mult=[1, 1, 2, 2, 4, 4], decoder_ch_mult=[1, 1, 2, 2, 4, 4], **kwargs))
+
+
+VQ_models = {'VQ-32': VQ_32, 'VQ-16': VQ_16, 'VQ-8': VQ_8}
