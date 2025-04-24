@@ -34,7 +34,7 @@ class VQModel(nn.Module):
         if not config.use_encoder_patch:
             self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
         else:
-            self.encoder = EncoderPatch(in_channels=3, z_channels=config.z_channels, patch_size=2 ** (len(config.encoder_ch_mult) - 1))
+            self.encoder = PatchEfficientNetEncoder(in_channels=3, z_channels=config.z_channels, patch_size=2 ** (len(config.encoder_ch_mult) - 1))
 
         self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
 
@@ -102,6 +102,117 @@ class EncoderPatch(nn.Module):
         out = embeddings.permute(0, 2, 1).view(B, self.z_channels, h, h)
         return out
 
+
+class MBConv(nn.Module):
+    def __init__(self, in_ch, out_ch, expansion=6, kernel_size=3, stride=1, reduction=4):
+        super().__init__()
+        mid_ch = in_ch * expansion
+        self.use_residual = (stride == 1 and in_ch == out_ch)
+
+        # expansion
+        self.conv_expand = nn.Conv2d(in_ch, mid_ch, kernel_size=1, bias=False)
+        self.bn0 = nn.BatchNorm2d(mid_ch)
+        # depthwise convolution
+        self.conv_dw = nn.Conv2d(mid_ch, mid_ch, kernel_size=kernel_size,
+                                 stride=stride, padding=kernel_size//2,
+                                 groups=mid_ch, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_ch)
+        # squeeze-and-excitation
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(mid_ch, mid_ch // reduction, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(mid_ch // reduction, mid_ch, kernel_size=1),
+            nn.Sigmoid()
+        )
+        # projection
+        self.conv_project = nn.Conv2d(mid_ch, out_ch, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+
+    def forward(self, x):
+        h = nn.SiLU()(self.bn0(self.conv_expand(x)))
+        h = nn.SiLU()(self.bn1(self.conv_dw(h)))
+        h = h * self.se(h)
+        h = self.bn2(self.conv_project(h))
+        if self.use_residual:
+            h = h + x
+        return h
+
+class EfficientBackbone(nn.Module):
+    def __init__(self, in_channels=3, width_mult=1.0, z_channels=256):
+        super().__init__()
+        # EfficientNet-B0 block settings: (expansion, out_channels, num_blocks, stride)
+        block_args = [
+            (1,  16, 1, 1),
+            (6,  24, 2, 2),
+            (6,  40, 2, 2),
+            (6,  80, 3, 2),
+            (6, 112, 3, 1),
+            (6, 192, 4, 2),
+            (6, 320, 1, 1),
+        ]
+        # Stem
+        stem_ch = int(32 * width_mult)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, stem_ch, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(stem_ch),
+            nn.SiLU()
+        )
+        # MBConv blocks
+        layers = []
+        in_ch = stem_ch
+        for exp, out_c, num, stride in block_args:
+            out_ch = int(out_c * width_mult)
+            for i in range(num):
+                s = stride if i == 0 else 1
+                layers.append(MBConv(in_ch, out_ch, expansion=exp, kernel_size=3, stride=s))
+                in_ch = out_ch
+        self.blocks = nn.Sequential(*layers)
+        # Head
+        head_ch = int(1280 * width_mult)
+        self.head = nn.Sequential(
+            nn.Conv2d(in_ch, head_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(head_ch),
+            nn.SiLU()
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.project = nn.Conv2d(head_ch, z_channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        h = self.stem(x)
+        h = self.blocks(h)
+        h = self.head(h)
+        h = self.pool(h)
+        h = self.project(h)
+        return h.view(h.size(0), -1)
+
+class PatchEfficientNetEncoder(nn.Module):
+    """
+    Splits input into non-overlapping patches, runs each through an EfficientNet-style
+    backbone, and reassembles into a per-patch latent map.
+    """
+    def __init__(self, in_channels=3, patch_size=32, width_mult=1.0, z_channels=256):
+        super().__init__()
+        self.patch_size = patch_size
+        self.backbone = EfficientBackbone(in_channels, width_mult, z_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        p = self.patch_size
+        assert H % p == 0 and W % p == 0, f"H and W must be divisible by patch_size={p}"
+        Hp, Wp = H // p, W // p
+        # slice into patches
+        patches = x.unfold(2, p, p).unfold(3, p, p)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+        patches = patches.view(-1, C, p, p)
+        # run backbone per patch (output shape: N_patches × z_channels)
+        feats = self.backbone(patches)
+        # reassemble to (B, z_channels, Hp, Wp)
+        zC = feats.size(1)
+        feats = feats.view(B, Hp, Wp, zC)
+        feats = feats.permute(0, 3, 1, 2).contiguous()
+        return feats
+    
 class Encoder(nn.Module):
     def __init__(self, in_channels=3, ch=128, ch_mult=(1,1,2,2,4), num_res_blocks=2, 
                  norm_type='group', dropout=0.0, resamp_with_conv=True, z_channels=256):
