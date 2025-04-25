@@ -210,7 +210,7 @@ def main(args):
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 recons_imgs, codebook_loss = vq_model(imgs)
                 loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
-                                   last_layer=vq_model.module._orig_mod.decoder.last_layer,
+                                   last_layer=vq_model.module.decoder.last_layer,
                                    logger=logger, log_every=args.log_every)
             loss_gen.backward()
             if args.max_grad_norm != 0.0:
