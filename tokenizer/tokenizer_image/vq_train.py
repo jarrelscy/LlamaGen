@@ -180,7 +180,6 @@ def main(args):
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
         vq_model = torch.compile(vq_model) # requires PyTorch 2.0        
-        vq_loss = torch.compile(vq_loss) # requires PyTorch 2.0   
     
     vq_model = DDP(vq_model.to(device), device_ids=[args.gpu])
     vq_model.train()
@@ -205,14 +204,19 @@ def main(args):
         running_disc_loss = 0.0
         for x, y in loader:
             imgs = x.to(device, non_blocking=True)
+
+            # Set requires_grad=False for perceptual loss parameters
+            for param in vq_loss.parameters():
+                param.requires_grad = False
+
             # generator training
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 recons_imgs, codebook_loss = vq_model(imgs)
                 loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
-                                   last_layer=vq_model.module.decoder.last_layer,
-                                   logger=logger, log_every=args.log_every)
-            loss_gen.backward()
+                                last_layer=vq_model.module.decoder.last_layer,
+                                logger=logger, log_every=args.log_every)
+            scaler.scale(loss_gen).backward()          
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(vq_model.parameters(), args.max_grad_norm)
@@ -221,12 +225,15 @@ def main(args):
             if args.ema:
                 update_ema(ema, vq_model.module._orig_mod if args.compile else vq_model.module)
 
-            # discriminator training            
+            # discriminator training                 
+            for param in vq_loss.parameters():
+                param.requires_grad = True
+
             optimizer_disc.zero_grad()
             with torch.cuda.amp.autocast(dtype=ptdtype):
                 loss_disc = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
                                     logger=logger, log_every=args.log_every)
-            loss_disc.backward()
+            scaler_disc.scale(loss_disc).backward()
             if args.max_grad_norm != 0.0:
                 scaler_disc.unscale_(optimizer_disc)
                 torch.nn.utils.clip_grad_norm_(vq_loss.module.discriminator.parameters(), args.max_grad_norm)
@@ -235,9 +242,8 @@ def main(args):
             
             # Log loss values:
             running_gen_loss += loss_gen.item()
-            running_disc_loss += loss_disc.item()
-            del imgs, x, y, recons_imgs, loss_gen, loss_disc
-            
+            # running_disc_loss += loss_disc.item()
+                
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:

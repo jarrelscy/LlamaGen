@@ -253,7 +253,7 @@ class Encoder(nn.Module):
         self.norm_out = Normalize(block_in, norm_type)
         self.conv_out = nn.Conv2d(block_in, z_channels, kernel_size=3, stride=1, padding=1)
 
-
+    
     def forward(self, x):
         h = self.conv_in(x)
         # downsampling
@@ -345,7 +345,7 @@ class Decoder(nn.Module):
         h = self.conv_out(h)
         return h
 
-
+@torch.compiler.disable(recursive=True)
 class VectorQuantizer(nn.Module):
     def __init__(self, n_e, e_dim, beta, entropy_loss_ratio, l2_norm, show_usage):
         super().__init__()
