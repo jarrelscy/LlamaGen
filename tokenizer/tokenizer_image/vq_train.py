@@ -115,6 +115,9 @@ def main(args):
         reconstruction_weight=args.reconstruction_weight,
         reconstruction_loss=args.reconstruction_loss,
         codebook_weight=args.codebook_weight,  
+        ssim_weight=args.ssim_weight,
+        ssim_win_size=args.ssim_win_size,
+        ssim_win_sigma=args.ssim_win_sigma
     ).to(device)
     logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
 
@@ -263,7 +266,10 @@ def main(args):
 
                 # Log to wandb on rank 0
                 if rank == 0:
-                    wandb.log({
+                    # Get the latest ssim_val from the logger (hacky, but avoids complex return from VQLoss)
+                    # Need to parse the log string to get it - alternatively, modify VQLoss to return a dict
+                    # For now, let's just log the config weight
+                    log_data = {
                         "overall_loss": avg_overall_loss,
                         "gen_loss": avg_gen_loss,
                         "disc_loss": avg_disc_loss,
@@ -273,7 +279,9 @@ def main(args):
                         "commit_loss": codebook_loss[1].item(),
                         "entropy_loss": codebook_loss[2].item(),
                         "codebook_usage": codebook_loss[3],
-                    }, step=train_steps)
+                        # Add ssim_val here if we modify VQLoss to return it
+                    }
+                    wandb.log(log_data, step=train_steps)
 
                 # Reset monitoring variables
                 running_gen_loss = 0.0
@@ -359,5 +367,8 @@ if __name__ == "__main__":
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     parser.add_argument("--use-encoder-patch", action='store_true', default=False, help="Use encoder patch instead of regular encoder")
+    parser.add_argument("--ssim-weight", type=float, default=0.0, help="SSIM loss weight (0.0 to disable)")
+    parser.add_argument("--ssim-win-size", type=int, default=11, help="Window size for SSIM calculation")
+    parser.add_argument("--ssim-win-sigma", type=float, default=1.5, help="Sigma for SSIM Gaussian window")
     args = parser.parse_args()
     main(args)
