@@ -1,16 +1,15 @@
-bash scripts/tokenizer/train_vq.sh --cloud-save-path /tmp/ctap_tokenizer_32 \
+bash scripts/tokenizer/train_vq.sh --cloud-save-path /tmp/ctap_tokenizer_16 \
 --data-path /tmp/ctap_jpegs \
 --image-size 256 \
 --global-batch-size 192 \
---vq-model VQ-32 \
+--vq-model VQ-16 \
 --use-encoder-patch \
 --codebook-size 32768 \
---results-dir results_tokenizer_image_efficientnet_recon_32 \
---perceptual-weight 1.5 \
---reconstruction-weight 1.5 \
+--results-dir results_tokenizer_image_efficientnet_recon_16 \
+--perceptual-weight 1.0 \
+--reconstruction-weight 1.0 \
 --disc-start 0 \
 --compile \
 --global-seed 42 \
 --ssim-weight 0.0 \
 --ckpt-every 2000 \
---vq-ckpt results_tokenizer_image_efficientnet_32/038-VQ-32/checkpoints/0034000.pt
