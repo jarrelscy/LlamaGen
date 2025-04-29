@@ -100,11 +100,10 @@ def _ssim(
     sigma12 = compensation * (gaussian_filter(X * Y, win) - mu1_mu2)
 
     cs_map = (2 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2)  # set alpha=beta=gamma=1
-    ssim_map = ((2 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)) * cs_map
-
+    ssim_map = ((2 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)) * cs_map    
     ssim_per_channel = torch.flatten(ssim_map, 2).mean(-1)
     cs = torch.flatten(cs_map, 2).mean(-1)
-    return ssim_per_channel, cs
+    return ssim_per_channel, cs, ssim_map, cs_map
 
 
 def ssim(
@@ -156,14 +155,14 @@ def ssim(
         win = _fspecial_gauss_1d(win_size, win_sigma)
         win = win.repeat([X.shape[1]] + [1] * (len(X.shape) - 1))
 
-    ssim_per_channel, cs = _ssim(X, Y, data_range=data_range, win=win, size_average=False, K=K)
+    ssim_per_channel, cs, ssim_map, cs_map = _ssim(X, Y, data_range=data_range, win=win, size_average=False, K=K)
     if nonnegative_ssim:
         ssim_per_channel = torch.relu(ssim_per_channel)
 
     if size_average:
-        return ssim_per_channel.mean()
+        return ssim_per_channel.mean(), ssim_map, cs_map
     else:
-        return ssim_per_channel.mean(1)
+        return ssim_per_channel.mean(1), ssim_map, cs_map
 
 
 class SSIM(torch.nn.Module):
@@ -339,7 +338,7 @@ class VQLoss(nn.Module):
                 # Shift inputs from [-1, 1] to [0, 1] for SSIM calculation
                 inputs_0_1 = (inputs.contiguous() + 1.0) / 2.0
                 reconstructions_0_1 = (reconstructions.contiguous() + 1.0) / 2.0
-                ssim_val = self.ssim_loss(inputs_0_1.mean(dim=1, keepdim=True), reconstructions_0_1.mean(dim=1, keepdim=True))
+                ssim_val, _, _ = self.ssim_loss(inputs_0_1.mean(dim=1, keepdim=True), reconstructions_0_1.mean(dim=1, keepdim=True))
 
             # SSIM loss term (1 - SSIM value)
             ssim_loss_term = 1.0 - ssim_val
