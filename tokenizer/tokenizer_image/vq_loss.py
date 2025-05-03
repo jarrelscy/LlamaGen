@@ -243,11 +243,50 @@ def adopt_weight(weight, global_step, threshold=0, value=0.):
     return weight
 
 
+# --- Helper Function for Feature Extraction (similar to explore.ipynb) ---
+def get_intermediate_features(discriminator, layer_index, x):
+    """Extracts features from an intermediate layer of the NLayerDiscriminator."""
+    # Assumes discriminator.main holds the sequential layers
+    if not hasattr(discriminator, 'main') or not isinstance(discriminator.main, nn.Sequential):
+        raise TypeError("Discriminator structure not as expected (missing .main or not Sequential)")
+
+    all_layers = list(discriminator.main.children())
+    num_layers = len(all_layers)
+
+    if layer_index >= num_layers:
+        # Try to find a sensible layer if index is out of bounds (e.g., last layer before final conv)
+        # Assuming final layer is Conv2d, find the last non-Conv2d layer index
+        conv_indices = [i for i, layer in enumerate(all_layers) if isinstance(layer, nn.Conv2d)]
+        if len(conv_indices) > 1:
+             # Use the layer before the last Conv2d
+             fallback_index = conv_indices[-1] -1
+             print(f"Warning: Requested layer index {layer_index} >= {num_layers}. Falling back to layer {fallback_index}.")
+             layer_index = fallback_index
+        else: # Cannot determine fallback, use the second to last layer overall
+             fallback_index = num_layers - 2
+             print(f"Warning: Requested layer index {layer_index} >= {num_layers}. Falling back to layer {fallback_index}.")
+             layer_index = max(0, fallback_index) # Ensure it's not negative
+
+    # Create a sequential model up to the desired layer
+    feature_extractor = nn.Sequential(*all_layers[:layer_index+1])
+
+    # Ensure the extractor is in eval mode if the main discriminator is
+    if not discriminator.training:
+        feature_extractor.eval()
+    feature_extractor.to(x.device)
+
+    with torch.no_grad(): # No gradients needed for feature extraction itself
+        features = feature_extractor(x)
+    return features
+# --- End Helper Function ---
+
 class VQLoss(nn.Module):
     def __init__(self, disc_start, disc_loss="hinge", disc_dim=64, disc_type='patchgan', image_size=256,
                  disc_num_layers=3, disc_in_channels=3, disc_weight=1.0, disc_adaptive_weight = False,
-                 gen_adv_loss='hinge', reconstruction_loss='l2', reconstruction_weight=1.0, 
-                 codebook_weight=1.0, perceptual_weight=1.0, 
+                 gen_adv_loss='hinge', reconstruction_loss='l2', reconstruction_weight=1.0,
+                 codebook_weight=1.0, perceptual_weight=1.0,
+                 disc_feature_weight=1.0, disc_feature_layer=7, # <-- Add new parameters
+                 disc_patchgan_actnorm=False, # Add flag for PatchGAN ActNorm
                  ssim_weight=0.0, ssim_win_size=11, ssim_win_sigma=1.5,
     ):
         super().__init__()
@@ -259,6 +298,7 @@ class VQLoss(nn.Module):
                 input_nc=disc_in_channels, 
                 n_layers=disc_num_layers,
                 ndf=disc_dim,
+                use_actnorm=disc_patchgan_actnorm,
             )
         elif disc_type == "stylegan":
             self.discriminator = StyleGANDiscriminator(
@@ -278,6 +318,8 @@ class VQLoss(nn.Module):
         self.discriminator_iter_start = disc_start
         self.disc_weight = disc_weight
         self.disc_adaptive_weight = disc_adaptive_weight
+        self.disc_feature_weight = disc_feature_weight
+        self.disc_feature_layer = disc_feature_layer
 
         assert gen_adv_loss in ["hinge", "non-saturating"]
         # gen_adv_loss
@@ -347,7 +389,18 @@ class VQLoss(nn.Module):
             logits_fake = self.discriminator(reconstructions.contiguous())
             generator_adv_loss = self.gen_adv_loss(logits_fake)
             
+            # discriminator feature loss
+            disc_feature_loss = torch.tensor(0.0, device=inputs.device)
+            if self.disc_feature_weight > 0 and isinstance(self.discriminator, PatchGANDiscriminator): # Only for PatchGAN for now
+                # Ensure discriminator is on the same device and in eval mode for feature extraction consistency
+                # (though gradients won't flow back through it here)
+                self.discriminator.eval()
+                feat_orig = get_intermediate_features(self.discriminator, self.disc_feature_layer, inputs.contiguous())
+                feat_recon = get_intermediate_features(self.discriminator, self.disc_feature_layer, reconstructions.contiguous())
+                self.discriminator.train() # Return to train mode if it was training
 
+                # Calculate MSE loss averaged over all dimensions (like explore.ipynb)
+                disc_feature_loss = F.mse_loss(feat_orig, feat_recon) # reduction='mean' by default
 
             if self.disc_adaptive_weight:
                 null_loss = self.rec_weight * rec_loss + self.perceptual_weight * p_loss
@@ -361,19 +414,30 @@ class VQLoss(nn.Module):
                 self.perceptual_weight * p_loss + \
                 self.ssim_weight * ssim_loss_term + \
                 disc_adaptive_weight * disc_weight * generator_adv_loss + \
+                self.disc_feature_weight * disc_feature_loss + \
                 codebook_loss[0] + codebook_loss[1] + codebook_loss[2]
             
+            # Prepare components for logging
+            log_dict = {
+                "rec_loss": (self.rec_weight * rec_loss).detach(),
+                "perceptual_loss": (self.perceptual_weight * p_loss).detach(),
+                "ssim_loss": (self.ssim_weight * ssim_loss_term).detach(),
+                "gen_adv_loss": (disc_adaptive_weight * disc_weight * generator_adv_loss).detach(),
+                "disc_feature_loss": (self.disc_feature_weight * disc_feature_loss).detach(),
+                "vq_loss": codebook_loss[0].detach(),
+                "commit_loss": codebook_loss[1].detach(),
+                "entropy_loss": codebook_loss[2].detach(),
+                "codebook_usage": codebook_loss[3]
+            }
             if global_step % log_every == 0:
-                rec_loss = self.rec_weight * rec_loss
-                p_loss = self.perceptual_weight * p_loss
-                ssim_log = self.ssim_weight * ssim_loss_term.detach()
-                generator_adv_loss = disc_adaptive_weight * disc_weight * generator_adv_loss
-                logger.info(f"(Generator) rec_loss: {rec_loss:.4f}, perceptual_loss: {p_loss:.4f}, "
-                            f"ssim_loss: {ssim_log:.4f}, "
-                            f"vq_loss: {codebook_loss[0]:.4f}, commit_loss: {codebook_loss[1]:.4f}, entropy_loss: {codebook_loss[2]:.4f}, "
-                            f"codebook_usage: {codebook_loss[3]:.4f}, generator_adv_loss: {generator_adv_loss:.4f}, "
-                            f"disc_adaptive_weight: {disc_adaptive_weight:.4f}, disc_weight: {disc_weight:.4f}")
-            return loss
+                # Additionally print to console
+                logger.info(f"(Generator) rec_loss: {log_dict['rec_loss']:.4f}, perceptual_loss: {log_dict['perceptual_loss']:.4f}, "
+                            f"ssim_loss: {log_dict['ssim_loss']:.4f}, vq_loss: {log_dict['vq_loss']:.4f}, "
+                            f"commit_loss: {log_dict['commit_loss']:.4f}, entropy_loss: {log_dict['entropy_loss']:.4f}, "
+                            f"codebook_usage: {log_dict['codebook_usage']:.4f}, "
+                            f"gen_adv_loss: {log_dict['gen_adv_loss']:.4f}, "
+                            f"disc_feature_loss: {log_dict['disc_feature_loss']:.4f}")
+            return loss, log_dict
 
         # discriminator update
         if optimizer_idx == 1:
@@ -383,10 +447,13 @@ class VQLoss(nn.Module):
             disc_weight = adopt_weight(self.disc_weight, global_step, threshold=self.discriminator_iter_start)
             d_adversarial_loss = disc_weight * self.disc_loss(logits_real, logits_fake)
             
+            log_dict = {
+                "disc_loss": d_adversarial_loss.detach(),
+                "logits_real": logits_real.detach().mean(),
+                "logits_fake": logits_fake.detach().mean()
+            }
             if global_step % log_every == 0:
-                logits_real = logits_real.detach().mean()
-                logits_fake = logits_fake.detach().mean()
-                logger.info(f"(Discriminator) " 
-                            f"discriminator_adv_loss: {d_adversarial_loss:.4f}, disc_weight: {disc_weight:.4f}, "
-                            f"logits_real: {logits_real:.4f}, logits_fake: {logits_fake:.4f}")
-            return d_adversarial_loss
+                logger.info(f"(Discriminator) discriminator_adv_loss: {log_dict['disc_loss']:.4f}, "
+                            f"disc_weight: {disc_weight:.4f}, logits_real: {log_dict['logits_real']:.4f}, "
+                            f"logits_fake: {log_dict['logits_fake']:.4f}")
+            return d_adversarial_loss, log_dict

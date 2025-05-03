@@ -105,7 +105,7 @@ def main(args):
     vq_model = vq_model.to(device)
 
     vq_loss = VQLoss(
-        disc_start=args.disc_start, 
+        disc_start=args.disc_start,
         disc_weight=args.disc_weight,
         disc_type=args.disc_type,
         disc_loss=args.disc_loss,
@@ -114,10 +114,13 @@ def main(args):
         perceptual_weight=args.perceptual_weight,
         reconstruction_weight=args.reconstruction_weight,
         reconstruction_loss=args.reconstruction_loss,
-        codebook_weight=args.codebook_weight,  
+        codebook_weight=args.codebook_weight,
         ssim_weight=args.ssim_weight,
         ssim_win_size=args.ssim_win_size,
-        ssim_win_sigma=args.ssim_win_sigma
+        ssim_win_sigma=args.ssim_win_sigma,
+        disc_feature_weight=args.disc_feature_weight,
+        disc_feature_layer=args.disc_feature_layer,
+        disc_patchgan_actnorm=args.disc_patchgan_actnorm
     ).to(device)
     logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
 
@@ -216,9 +219,9 @@ def main(args):
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 recons_imgs, codebook_loss = vq_model(imgs)
-                loss_gen = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
-                                last_layer=vq_model.module.decoder.last_layer,
-                                logger=logger, log_every=args.log_every)
+                loss_gen, gen_log = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1, 
+                                            last_layer=vq_model.module.decoder.last_layer,
+                                            logger=logger, log_every=args.log_every)
             scaler.scale(loss_gen).backward()          
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
@@ -234,8 +237,8 @@ def main(args):
 
             optimizer_disc.zero_grad()
             with torch.cuda.amp.autocast(dtype=ptdtype):
-                loss_disc = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
-                                    logger=logger, log_every=args.log_every)
+                loss_disc, disc_log = vq_loss(codebook_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
+                                              logger=logger, log_every=args.log_every)
             scaler_disc.scale(loss_disc).backward()
             if args.max_grad_norm != 0.0:
                 scaler_disc.unscale_(optimizer_disc)
@@ -245,7 +248,7 @@ def main(args):
             
             # Log loss values:
             running_gen_loss += loss_gen.item()
-            # running_disc_loss += loss_disc.item()
+            running_disc_loss += loss_disc.item()
                 
             log_steps += 1
             train_steps += 1
@@ -266,21 +269,21 @@ def main(args):
 
                 # Log to wandb on rank 0
                 if rank == 0:
-                    # Get the latest ssim_val from the logger (hacky, but avoids complex return from VQLoss)
-                    # Need to parse the log string to get it - alternatively, modify VQLoss to return a dict
-                    # For now, let's just log the config weight
+                    # Prepare log data with averaged metrics
                     log_data = {
-                        "overall_loss": avg_overall_loss,
-                        "gen_loss": avg_gen_loss,
-                        "disc_loss": avg_disc_loss,
-                        "steps_per_sec": steps_per_sec,
-                        "epoch": epoch,
-                        "vq_loss": codebook_loss[0].item(),
-                        "commit_loss": codebook_loss[1].item(),
-                        "entropy_loss": codebook_loss[2].item(),
-                        "codebook_usage": codebook_loss[3],
-                        # Add ssim_val here if we modify VQLoss to return it
+                        "train/overall_loss": avg_overall_loss,
+                        "train/gen_loss": avg_gen_loss,
+                        "train/disc_loss": avg_disc_loss,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/epoch": epoch,
+                        "train/step": train_steps,
                     }
+                    # Add detailed generator metrics from the latest batch
+                    for key, value in gen_log.items():
+                        log_data[f"train/{key}"] = value.item() if hasattr(value, "item") else value
+                    # Add detailed discriminator metrics from the latest batch
+                    # for key, value in disc_log.items():
+                    #    log_data[f"disc/{key}"] = value.item() if hasattr(value, "item") else value
                     wandb.log(log_data, step=train_steps)
 
                 # Reset monitoring variables
@@ -370,5 +373,8 @@ if __name__ == "__main__":
     parser.add_argument("--ssim-weight", type=float, default=0.0, help="SSIM loss weight (0.0 to disable)")
     parser.add_argument("--ssim-win-size", type=int, default=11, help="Window size for SSIM calculation")
     parser.add_argument("--ssim-win-sigma", type=float, default=1.5, help="Sigma for SSIM Gaussian window")
+    parser.add_argument("--disc-feature-weight", type=float, default=0.0, help="Weight for discriminator feature map MSE loss")
+    parser.add_argument("--disc-feature-layer", type=int, default=7, help="Layer index in discriminator to extract features from (PatchGAN)")
+    parser.add_argument("--disc-patchgan-actnorm", action='store_true', default=False, help="Use ActNorm in PatchGAN discriminator")
     args = parser.parse_args()
     main(args)
