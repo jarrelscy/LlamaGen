@@ -408,13 +408,14 @@ class VQLoss(nn.Module):
             else:
                 disc_adaptive_weight = 1
             disc_weight = adopt_weight(self.disc_weight, global_step, threshold=self.discriminator_iter_start)
+            disc_feature_weight = adopt_weight(self.disc_feature_weight, global_step, threshold=self.discriminator_iter_start)
             
             # Combine all losses
             loss = self.rec_weight * rec_loss + \
                 self.perceptual_weight * p_loss + \
                 self.ssim_weight * ssim_loss_term + \
                 disc_adaptive_weight * disc_weight * generator_adv_loss + \
-                self.disc_feature_weight * disc_feature_loss + \
+                disc_feature_weight * disc_feature_loss + \
                 codebook_loss[0] + codebook_loss[1] + codebook_loss[2]
             
             # Prepare components for logging
@@ -423,7 +424,7 @@ class VQLoss(nn.Module):
                 "perceptual_loss": (self.perceptual_weight * p_loss).detach(),
                 "ssim_loss": (self.ssim_weight * ssim_loss_term).detach(),
                 "gen_adv_loss": (disc_adaptive_weight * disc_weight * generator_adv_loss).detach(),
-                "disc_feature_loss": (self.disc_feature_weight * disc_feature_loss).detach(),
+                "disc_feature_loss": (disc_feature_weight * disc_feature_loss).detach(),
                 "vq_loss": codebook_loss[0].detach(),
                 "commit_loss": codebook_loss[1].detach(),
                 "entropy_loss": codebook_loss[2].detach(),
